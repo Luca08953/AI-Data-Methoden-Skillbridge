@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Alte App-Versionen
+skillbridge_v1.py
+skillbridge_v2.py
+skillbridge_v3.py
+skillbridge_v4.py
+skillbridge_v5.py
+skillbridge_v7_9.py
+
+# Rohdaten (zu gross für GitHub)
+Data/linkedin_*.csv
+Data/Banking_clustered.csv
+Data/ConsultingData_clustered.csv
+Data/Legal_clustered.csv
+Data/Banking_enriched_scientific.csv
+Data/salary_benchmarks_switzerland.csv
+
+# Python
+__pycache__/
+*.pyc
+.env
