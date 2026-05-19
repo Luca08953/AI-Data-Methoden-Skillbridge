@@ -748,6 +748,331 @@ def generate_rapport(selected_skills, missing_set, best_fit_roles,
     ]
     return "\n".join(lines)
 
+
+def generate_html_rapport(selected_skills, missing_set, best_fit_roles,
+                          cluster_gaps, skill_score_df, top_skills_dict,
+                          salary_impact_df, importance_senior, primary_cat,
+                          sel_p1=None, requirements=None, active_profiles=None):
+    import datetime, base64
+    today = datetime.date.today().strftime("%d. %B %Y")
+    n_datasets = {"Consulting & Strategy": "46.000", "Finance & Banking": "49.000"}
+    n_jobs     = n_datasets.get(primary_cat, "46.000")
+    sel_p1     = sel_p1 or (best_fit_roles[0]["profile"] if best_fit_roles else "")
+    requirements = requirements or {}
+    active_profiles = active_profiles or [sel_p1]
+
+    # ── Linked Dimensions (wie Tab 2 / Tab 3) ────────────────
+    if primary_cat == "Finance & Banking":
+        linked_dims = set()
+        profile_reqs = requirements.get(sel_p1, {})
+        top3 = sorted(profile_reqs.items(), key=lambda x: x[1], reverse=True)[:3]
+        linked_dims.update(d for d, r in top3 if r > 0)
+        if not linked_dims:
+            p1_role = next((r for r in best_fit_roles if r["profile"] == sel_p1), None)
+            if p1_role:
+                linked_dims = {dd["dim"] for dd in p1_role["dims_detail"]}
+    else:
+        linked_dims = {sel_p1}
+
+    linked_gaps = [g for g in cluster_gaps if g["cluster"] in linked_dims]
+    if not linked_gaps:
+        linked_gaps = cluster_gaps[:3]
+
+    linked_missing = set(s for g in linked_gaps for s in g["missing"])
+
+    # ── Hilfsfunktionen ───────────────────────────────────────
+    def svs_bar(score, color="#455F51"):
+        w = min(int(score), 100)
+        return (f'<div style="background:#E8EEF3;border-radius:3px;height:6px;width:100%;margin-top:3px">'
+                f'<div style="background:{color};width:{w}%;height:6px;border-radius:3px"></div></div>')
+
+    def skill_pill(s, color="#455F51", bg="#EEF4F0"):
+        return (f'<span style="background:{bg};color:{color};padding:2px 8px;border-radius:10px;'
+                f'font-size:11px;margin:2px;display:inline-block">{s.title()}</span>')
+
+    # ── Radar Chart als Base64-Bild ───────────────────────────
+    radar_html = ""
+    try:
+        T_light = dict(
+            font_clr="#334155", muted="#64748B", grid="#CBD5E1",
+            bg="#fff", bg2="#fff", bg3="#F8FAFC",
+            accent="#5F8A91", green="#27AE60", yellow="#F1C40F",
+            text="#334155", border="#E2EAF0", border2="#CBD5E1",
+            progress="#E8EEF3", red="#DC2626",
+        )
+        fig = make_interactive_radar(cluster_gaps, requirements, active_profiles, T=T_light)
+        fig.update_layout(height=360, margin=dict(l=50, r=50, t=30, b=60),
+                          paper_bgcolor="white",
+                          polar=dict(bgcolor="white"))
+        img_bytes = fig.to_image(format="png", width=650, height=360, scale=1.5)
+        img_b64   = base64.b64encode(img_bytes).decode()
+        radar_html = (f'<img src="data:image/png;base64,{img_b64}" '
+                      f'style="width:100%;border-radius:8px;border:1px solid #E2EAF0">')
+    except Exception as e:
+        radar_html = f'<div style="color:#94A3B8;font-size:12px;text-align:center">Radar nicht verfügbar ({e})</div>'
+
+    # ── Fehlende Hard Skills (gefiltert auf linked dims) ──────
+    seen_skills = set()
+    missing_hard_rows = []
+    for gap in sorted(linked_gaps, key=lambda g: g["coverage"]):
+        for s in gap["missing"]:
+            if s in seen_skills: continue
+            seen_skills.add(s)
+            if classify_skill(s) != "hard": continue
+            row = skill_score_df[skill_score_df["skill"] == s]
+            if not row.empty:
+                r = row.iloc[0]
+                missing_hard_rows.append((s, int(r["score"]), round(r["demand_pct"]),
+                                          round(r["career_ratio"]*100),
+                                          round(r["salary_ratio"], 2),
+                                          str(r.get("modifier", ""))))
+            if len(missing_hard_rows) >= 8: break
+        if len(missing_hard_rows) >= 8: break
+    missing_hard_rows.sort(key=lambda x: x[1], reverse=True)
+
+    # ── Skill-Hebel Gehalt (gefiltert auf linked dims) ────────
+    sal_seen = set()
+    sal_levers = []
+    if not salary_impact_df.empty:
+        for _, r in salary_impact_df.sort_values("salary_diff", ascending=False).iterrows():
+            s = r["skill"]
+            if s in sal_seen or s not in linked_missing: continue
+            sal_seen.add(s)
+            sal_levers.append((s, int(r["salary_diff"])))
+            if len(sal_levers) >= 5: break
+
+    # ── Skill-Hebel Karriere (gefiltert auf linked dims) ──────
+    career_seen = set()
+    career_levers = []
+    if not importance_senior.empty:
+        for _, r in importance_senior.sort_values("importance", ascending=False).iterrows():
+            s = r["skill"]
+            if s in career_seen or s not in linked_missing: continue
+            career_seen.add(s)
+            career_levers.append((s, round(r["importance"]*1000, 2)))
+            if len(career_levers) >= 5: break
+
+    # ── HTML-Bausteine ────────────────────────────────────────
+    salary_note = ("Robert Half Salary Guide Schweiz 2024"
+                   if primary_cat == "Finance & Banking"
+                   else "Aus LinkedIn-Inseraten extrahiert")
+
+    match_rows = ""
+    for i, role in enumerate(best_fit_roles[:3]):
+        icons = ["🥇", "🥈", "🥉"]
+        sal = role["salary"]; cov = role["fit_pct"]
+        cov_color = "#27AE60" if cov >= 60 else ("#F1C40F" if cov >= 35 else "#E67E22")
+        sel_marker = " ◀ gewählt" if role["profile"] == sel_p1 else ""
+        match_rows += f"""
+        <tr>
+          <td style="padding:7px 10px;font-weight:600">{icons[i]} {role['profile']}
+            <span style="color:#5F8A91;font-size:11px">{sel_marker}</span></td>
+          <td style="padding:7px 10px;text-align:center">
+            <span style="color:{cov_color};font-weight:700;font-size:15px">{cov}%</span>
+            <div style="background:#E8EEF3;border-radius:3px;height:5px;margin-top:3px">
+              <div style="background:{cov_color};width:{cov}%;height:5px;border-radius:3px"></div>
+            </div>
+          </td>
+          <td style="padding:7px 10px;text-align:right;color:#455F51;font-weight:600">CHF {sal['mid']:,}</td>
+          <td style="padding:7px 10px;color:#64748B;font-size:12px">Entry {sal['entry']:,} / Senior {sal['senior']:,}</td>
+        </tr>"""
+
+    # Dimension-Übersicht für gewähltes Profil
+    dim_rows = ""
+    for gap in sorted(linked_gaps, key=lambda g: g["coverage"]):
+        cov = gap["coverage"]
+        cov_c = "#27AE60" if cov >= 70 else ("#F1C40F" if cov >= 40 else "#E67E22")
+        n_miss = len(gap["missing"]); n_has = len(gap["has"])
+        top_miss = ", ".join(s.title() for s in gap["missing"][:3] if classify_skill(s) == "hard")
+        dim_rows += f"""
+        <tr>
+          <td style="padding:6px 10px;font-weight:600">{gap['cluster']}</td>
+          <td style="padding:6px 10px;text-align:center">
+            <span style="color:{cov_c};font-weight:700">{cov}%</span>
+            <div style="background:#E8EEF3;border-radius:3px;height:4px;margin-top:3px">
+              <div style="background:{cov_c};width:{cov}%;height:4px;border-radius:3px"></div>
+            </div>
+          </td>
+          <td style="padding:6px 10px;text-align:center;color:#64748B">{n_has} ✅ / {n_miss} ❌</td>
+          <td style="padding:6px 10px;color:#64748B;font-size:11px">{top_miss}</td>
+        </tr>"""
+
+    skill_rows = ""
+    for s, svs, demand, career, sal_r, modifier in missing_hard_rows:
+        boost = ""
+        if modifier == "sig_boost":
+            boost = '<span style="color:#27AE60;font-size:10px"> ✅ Gehaltsboost ×1.25</span>'
+        skill_rows += f"""
+        <tr>
+          <td style="padding:6px 10px;font-weight:600">{s.title()}{boost}</td>
+          <td style="padding:6px 10px;text-align:center">
+            <span style="color:#455F51;font-weight:700">{svs}/100</span>
+            {svs_bar(svs)}
+          </td>
+          <td style="padding:6px 10px;text-align:center;color:#64748B">{demand}%</td>
+          <td style="padding:6px 10px;text-align:center;color:#64748B">{career}%</td>
+          <td style="padding:6px 10px;text-align:center;color:#64748B">{sal_r}x</td>
+        </tr>"""
+
+    sal_lever_html = ""
+    for s, chf in sal_levers:
+        d = top_skills_dict.get(s, 0)
+        sal_lever_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;
+                    padding:5px 0;border-bottom:1px solid #E8EEF3">
+          <span style="font-weight:600;font-size:13px">{s.title()}</span>
+          <span style="color:#27AE60;font-weight:700">+CHF {chf:,}</span>
+          <span style="color:#94A3B8;font-size:11px">{d}% der Stellen</span>
+        </div>"""
+
+    career_lever_html = ""
+    for s, imp in career_levers:
+        d = top_skills_dict.get(s, 0)
+        career_lever_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;
+                    padding:5px 0;border-bottom:1px solid #E8EEF3">
+          <span style="font-weight:600;font-size:13px">{s.title()}</span>
+          <span style="color:#5F8A91;font-weight:700">{imp:.2f}</span>
+          <span style="color:#94A3B8;font-size:11px">{d}% der Stellen</span>
+        </div>"""
+
+    selected_pills = "".join(skill_pill(s) for s in sorted(selected_skills)[:30])
+    if len(selected_skills) > 30:
+        selected_pills += skill_pill(f"+{len(selected_skills)-30} weitere", "#64748B", "#F1F5F9")
+
+    html = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
+          font-size: 13px; color: #334155; background: #fff; }}
+  .page {{ max-width: 800px; margin: 0 auto; padding: 32px 36px; }}
+  h2 {{ font-size: 15px; color: #455F51; font-weight: 700;
+        border-left: 4px solid #5F8A91; padding-left: 10px;
+        margin: 22px 0 10px 0; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  tr:nth-child(even) {{ background: #F8FAFC; }}
+  th {{ background: #455F51; color: #fff; padding: 8px 10px; font-size: 12px; text-align: left; }}
+  .interpret {{ background: #F8FAFC; border: 1px solid #E2EAF0;
+                border-radius: 8px; padding: 14px 18px; margin-top: 8px; }}
+  .interpret p {{ margin-bottom: 6px; line-height: 1.5; font-size: 12px; color: #475569; }}
+  .footer {{ margin-top: 28px; padding-top: 12px; border-top: 1px solid #E2EAF0;
+             font-size: 11px; color: #94A3B8; text-align: center; }}
+  @media print {{
+    body {{ font-size: 12px; }}
+    .page {{ padding: 18px 22px; }}
+    h2 {{ margin: 12px 0 7px 0; }}
+  }}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- HEADER -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-end;
+              border-bottom:3px solid #455F51;padding-bottom:14px;margin-bottom:18px">
+    <div>
+      <div style="font-size:26px;font-weight:800;color:#455F51;letter-spacing:-0.5px">SkillBridge</div>
+      <div style="font-size:13px;color:#5F8A91;margin-top:2px">
+        Persönlicher Karriere-Rapport · {primary_cat}
+      </div>
+    </div>
+    <div style="text-align:right;font-size:12px;color:#94A3B8">
+      {today}<br>
+      <span style="color:#455F51;font-weight:600">{len(selected_skills)} Skills analysiert</span><br>
+      <span style="color:#5F8A91;font-weight:600">Zielprofil: {sel_p1}</span>
+    </div>
+  </div>
+
+  <!-- SEKTION 1: DEINE SKILLS -->
+  <h2>📋 Deine ausgewählten Skills</h2>
+  <div style="line-height:2.2">{selected_pills}</div>
+
+  <!-- SEKTION 2: TOP JOB-MATCHES + RADAR -->
+  <h2>🎯 Top Job-Matches & Skill-Profil (Zielprofil: {sel_p1})</h2>
+  <div style="display:flex;gap:20px;align-items:flex-start">
+    <div style="flex:1.1">
+      <table>
+        <thead><tr>
+          <th>Profil</th><th style="text-align:center">Coverage</th>
+          <th style="text-align:right">Mid-Gehalt</th>
+        </tr></thead>
+        <tbody>{match_rows}</tbody>
+      </table>
+      <div style="font-size:11px;color:#94A3B8;margin-top:5px">Gehaltsquelle: {salary_note}</div>
+    </div>
+    <div style="flex:1;min-width:0">{radar_html}</div>
+  </div>
+
+  <!-- SEKTION 3: DIMENSIONS-ÜBERSICHT -->
+  <h2>📊 Skill-Gap nach Dimension (für Zielprofil: {sel_p1})</h2>
+  <table>
+    <thead><tr>
+      <th>Dimension</th><th style="text-align:center">Coverage</th>
+      <th style="text-align:center">Skills</th><th>Top fehlende Hard Skills</th>
+    </tr></thead>
+    <tbody>{dim_rows}</tbody>
+  </table>
+
+  <!-- SEKTION 4: FEHLENDE HARD SKILLS NACH SVS -->
+  <h2>📈 Fehlende Hard Skills nach SVS – priorisiert</h2>
+  <table>
+    <thead><tr>
+      <th>Skill</th><th style="text-align:center">SVS Score</th>
+      <th style="text-align:center">Nachfrage</th>
+      <th style="text-align:center">Karriere</th>
+      <th style="text-align:center">Gehalt</th>
+    </tr></thead>
+    <tbody>{skill_rows if skill_rows else
+      '<tr><td colspan="5" style="padding:10px;color:#94A3B8;text-align:center">Alle Hard Skills in diesem Profil bereits vorhanden ✅</td></tr>'}</tbody>
+  </table>
+
+  <!-- SEKTION 5: SKILL-HEBEL -->
+  <div style="display:flex;gap:24px;margin-top:4px">
+    <div style="flex:1">
+      <h2>💰 Skill-Hebel: Gehalt</h2>
+      <div style="font-size:11px;color:#64748B;margin-bottom:8px">
+        Statistisch signifikanter Mehrgehalt vs. Median (t-Test, p&lt;0.05)
+      </div>
+      {sal_lever_html or '<div style="color:#94A3B8;font-size:12px">Keine Daten.</div>'}
+    </div>
+    <div style="flex:1">
+      <h2>🚀 Skill-Hebel: Karriere</h2>
+      <div style="font-size:11px;color:#64748B;margin-bottom:8px">
+        RF Feature Importance Senior-Klassifikation (×1000)
+      </div>
+      {career_lever_html or '<div style="color:#94A3B8;font-size:12px">Keine Daten.</div>'}
+    </div>
+  </div>
+
+  <!-- SEKTION 6: INTERPRETATIONSHILFE -->
+  <h2>ℹ️ So liest du diesen Report</h2>
+  <div class="interpret">
+    <p><strong>Skill-Coverage:</strong> Wie viele Prozent der Anforderungen eines Job-Profils du abdeckst,
+    SVS-gewichtet. 60–70% = solide Basis; 80%+ = sehr gute Ausgangslage.</p>
+    <p><strong>SVS Score (0–100):</strong> Kombiniert Nachfrage (30%), Karrierepotenzial (40%) und
+    Gehaltspremium (30%). Modifier: Stat. Gehaltsboost ×1.25 · Soft Skills ×0.4 · Basic Skills ×0.2.</p>
+    <p><strong>Nachfrage:</strong> In wie vielen % der {n_jobs} LinkedIn-Stellen dieser Skill verlangt wird.</p>
+    <p><strong>Karriere:</strong> Random-Forest-Modell: wie stark unterscheidet der Skill Senior- von Junior-Profilen.</p>
+    <p><strong>Gehalt-Hebel:</strong> Stellen mit diesem Skill zahlen im Median CHF X mehr (stat. signifikant).</p>
+    <p><strong>Radar-Diagramm:</strong> Grüne Fläche = dein Skill-Profil. Gepunktete Linie = Anforderungen des Zielprofils.
+    Je mehr Überlappung, desto besser passt du bereits.</p>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    Datenquellen: LinkedIn ({primary_cat}: {n_jobs} Jobs, 2024) · {salary_note} ·
+    SkillBridge – HSG MBI AI & Data Methoden Capstone · Keine Gewähr auf Vollständigkeit oder Aktualität.
+  </div>
+
+</div>
+</body>
+</html>"""
+    return html
+
+
 def make_svs_mws_comparison_chart(mws_df, selected_set, top_n=15):
     df = mws_df.copy()
     df["Status"] = df["skill"].apply(lambda s: "Vorhanden" if s in selected_set else "Fehlend")
@@ -870,7 +1195,7 @@ def render_dimension_card(gap, skill_score_df, selected_set, global_sal_median):
 # ══════════════════════════════════════════════════════════════
 
 if "light_mode" not in st.session_state:
-    st.session_state.light_mode = False
+    st.session_state.light_mode = True
 
 _hdr_r_col, = st.columns([1])
 with _hdr_r_col:
@@ -917,7 +1242,12 @@ if st.session_state.light_mode:
     [data-testid="stAlert"] p { color: #1A2A40 !important; }
     [data-testid="stSidebar"] { background: #EEF2F8 !important; }
     [data-testid="stDownloadButton"] button { background: #E8EEF8 !important; color: #1A2A40 !important; border-color: #9AAFC4 !important; }
-    html body [data-testid="stVerticalBlockBorderWrapper"] { border: 1.5px solid #6090B8 !important; border-radius: 10px !important; background-color: #FFFFFF !important; }
+    html body [data-testid="stVerticalBlockBorderWrapper"],
+    html body [data-testid="stVerticalBlockBorderWrapper"] > div:first-child {
+        border: 2px solid #7AAED6 !important;
+        border-radius: 12px !important;
+        background-color: rgba(240, 246, 255, 0.5) !important;
+    }
     [data-testid="stCheckbox"] label { color: #1A2A40 !important; font-weight: 500 !important; }
     [data-testid="stCheckbox"] span { color: #1A2A40 !important; }
     </style>""", unsafe_allow_html=True)
@@ -1315,27 +1645,46 @@ with tab1:
                           "requirement": 100, "coverage": sel_gap_road["coverage"]}
                          ] if sel_gap_road else []
 
-    top_missing_road = []
+    top_missing_hard = []
+    top_missing_soft = []
     for d in sorted(dim_gaps_road, key=lambda x: x["gap"], reverse=True):
         for s in d["missing"]:
-            if s not in top_missing_road and classify_skill(s) == "hard":
-                top_missing_road.append(s)
-            if len(top_missing_road) >= 9:
-                break
-        if len(top_missing_road) >= 9:
+            sc = classify_skill(s)
+            if sc == "hard" and s not in top_missing_hard:
+                top_missing_hard.append(s)
+            elif sc == "soft" and s not in top_missing_soft:
+                top_missing_soft.append(s)
+        if len(top_missing_hard) >= 9 and len(top_missing_soft) >= 6:
             break
 
-    road_steps = [
-        ("🚀 Schritt 1: Sofort starten",
-         "Höchste Priorität. Diese Skills haben den grössten Markteffekt.",
-         T["rank1"], top_missing_road[:3]),
-        ("📚 Schritt 2: Nächste 3 Monate",
-         "Vertieft und ergänzt Schritt 1.",
-         T["rank2"], top_missing_road[3:6]),
-        ("🎯 Schritt 3: Mittelfristig",
-         "Spezialisierung und Differenzierung.",
-         T["accent"], top_missing_road[6:9]),
-    ]
+    # Wenn keine Hard Skills fehlen → Soft Skills als Fallback zeigen
+    if top_missing_hard:
+        top_missing_road = top_missing_hard[:9]
+        road_steps = [
+            ("🚀 Schritt 1: Sofort starten",
+             "Höchste Priorität. Diese Skills haben den grössten Markteffekt.",
+             T["rank1"], top_missing_road[:3]),
+            ("📚 Schritt 2: Nächste 3 Monate",
+             "Vertieft und ergänzt Schritt 1.",
+             T["rank2"], top_missing_road[3:6]),
+            ("🎯 Schritt 3: Mittelfristig",
+             "Spezialisierung und Differenzierung.",
+             T["accent"], top_missing_road[6:9]),
+        ]
+    else:
+        # Alle Hard Skills vorhanden → zeige fehlende Soft Skills
+        top_missing_road = top_missing_soft[:6]
+        road_steps = [
+            ("✅ Hard Skills: komplett",
+             "Du hast alle relevanten Hard Skills für dieses Profil.",
+             T["green"], []),
+            ("💬 Soft Skill 1–3 entwickeln",
+             "Diese Soft Skills werden am häufigsten in diesem Bereich verlangt.",
+             T["accent"], top_missing_soft[:3]),
+            ("💬 Soft Skill 4–6 entwickeln",
+             "Weitere Soft Skills zur Differenzierung.",
+             T["muted"], top_missing_soft[3:6]),
+        ]
 
     road_cols = st.columns(3)
     for ci, (label, desc, color, skills) in enumerate(road_steps):
@@ -1357,18 +1706,26 @@ with tab1:
                 f'<div style="color:{T["muted"]};font-size:0.72em;margin-bottom:8px">{desc}</div>'
                 + items + '</div>', unsafe_allow_html=True)
 
-    if primary_cat == "Finance & Banking":
-        st.markdown("---")
-        rapport_txt = generate_rapport(
-            selected_skills, missing_set, best_fit_roles,
-            active_profiles, cluster_gaps, requirements, primary_cat)
-        dl_col, info_col = st.columns([2, 5])
-        with dl_col:
-            st.download_button("📥 Rapport herunterladen (.txt)",
-                                data=rapport_txt, file_name="skillbridge_rapport.txt",
-                                mime="text/plain", use_container_width=True)
-        with info_col:
-            st.caption("Persönlicher Karriere-Rapport mit Skills, Top-Profilen und Lückenanalyse.")
+    st.markdown("---")
+    html_rapport = generate_html_rapport(
+        selected_skills, missing_set, best_fit_roles,
+        cluster_gaps, skill_score_df, top_skills_dict,
+        salary_impact_df, importance_senior, primary_cat,
+        sel_p1=sel_p1, requirements=requirements,
+        active_profiles=active_profiles)
+    dl_col, info_col = st.columns([2, 5])
+    with dl_col:
+        st.download_button(
+            "📥 Karriere-Report herunterladen",
+            data=html_rapport,
+            file_name="skillbridge_rapport.html",
+            mime="text/html",
+            use_container_width=True,
+            type="primary")
+    with info_col:
+        st.caption(
+            "Öffne die HTML-Datei im Browser → Cmd+P (Mac) / Ctrl+P (Windows) "
+            "→ 'Als PDF sichern' für ein druckfertiges PDF.")
 
 
 # ══════════════════════════════════════════════════════════════
